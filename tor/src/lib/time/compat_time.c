@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -164,6 +164,8 @@ static int64_t last_tick_count = 0;
  * to be monotonic; increments them as appropriate so that they actually
  * _are_ monotonic.
  *
+ * The returned time may be the same as the previous returned time.
+ *
  * Caller must hold lock. */
 STATIC int64_t
 ratchet_performance_counter(int64_t count_raw)
@@ -201,6 +203,8 @@ static struct timeval timeofday_offset = { 0, 0 };
 /** Helper for gettimeofday(): Called with a sequence of times that are
  * supposed to be monotonic; increments them as appropriate so that they
  * actually _are_ monotonic.
+ *
+ * The returned time may be the same as the previous returned time.
  *
  * Caller must hold lock. */
 STATIC void
@@ -249,11 +253,14 @@ monotime_init_internal(void)
   tor_assert(mach_time_info.denom != 0);
 
   {
-    // approximate only.
-    uint64_t ns_per_tick = mach_time_info.numer / mach_time_info.denom;
-    uint64_t ms_per_tick = ns_per_tick * ONE_MILLION;
+    // We want to compute this, approximately:
+    //   uint64_t ns_per_tick = mach_time_info.numer / mach_time_info.denom;
+    //   uint64_t ticks_per_ms = ONE_MILLION / ns_per_tick;
+    // This calculation multiplies first, though, to improve accuracy.
+    uint64_t ticks_per_ms = (ONE_MILLION * mach_time_info.denom)
+      / mach_time_info.numer;
     // requires that tor_log2(0) == 0.
-    monotime_shift = tor_log2(ms_per_tick);
+    monotime_shift = tor_log2(ticks_per_ms);
   }
   {
     // For converting ticks to milliseconds in a 32-bit-friendly way, we
@@ -270,7 +277,9 @@ monotime_init_internal(void)
 }
 
 /**
- * Set "out" to the most recent monotonic time value
+ * Set "out" to the most recent monotonic time value.
+ *
+ * The returned time may be the same as the previous returned time.
  */
 void
 monotime_get(monotime_t *out)
@@ -298,10 +307,12 @@ monotime_coarse_get(monotime_coarse_t *out)
 #endif /* defined(TOR_UNIT_TESTS) */
   out->abstime_ = mach_approximate_time();
 }
-#endif
+#endif /* defined(HAVE_MACH_APPROXIMATE_TIME) */
 
 /**
  * Return the number of nanoseconds between <b>start</b> and <b>end</b>.
+ *
+ * The returned value may be equal to zero.
  */
 int64_t
 monotime_diff_nsec(const monotime_t *start,
@@ -522,7 +533,9 @@ monotime_init_internal(void)
     GetTickCount64_fn = (GetTickCount64_fn_t) (void(*)(void))
       GetProcAddress(h, "GetTickCount64");
   }
-  // FreeLibrary(h) ?
+  // We can't call FreeLibrary(h) here, because freeing the handle may
+  // unload the library, and cause future calls to GetTickCount64_fn()
+  // to fail. See 29642 for details.
 }
 
 void
@@ -757,7 +770,7 @@ monotime_coarse_zero(monotime_coarse_t *out)
 {
   memset(out, 0, sizeof(*out));
 }
-#endif
+#endif /* defined(MONOTIME_COARSE_TYPE_IS_DIFFERENT) */
 
 int64_t
 monotime_diff_usec(const monotime_t *start,
@@ -787,8 +800,8 @@ monotime_absolute_nsec(void)
   return monotime_diff_nsec(&initialized_at, &now);
 }
 
-uint64_t
-monotime_absolute_usec(void)
+MOCK_IMPL(uint64_t,
+monotime_absolute_usec,(void))
 {
   return monotime_absolute_nsec() / 1000;
 }
@@ -797,6 +810,12 @@ uint64_t
 monotime_absolute_msec(void)
 {
   return monotime_absolute_nsec() / ONE_MILLION;
+}
+
+uint64_t
+monotime_absolute_sec(void)
+{
+  return monotime_absolute_nsec() / ONE_BILLION;
 }
 
 #ifdef MONOTIME_COARSE_FN_IS_DIFFERENT
@@ -823,7 +842,18 @@ monotime_coarse_absolute_msec(void)
 {
   return monotime_coarse_absolute_nsec() / ONE_MILLION;
 }
-#else
+
+uint64_t
+monotime_coarse_absolute_sec(void)
+{
+  /* Note: Right now I'm not too concerned about 64-bit division, but if this
+   * ever becomes a hotspot we need to optimize, we can modify this to grab
+   * tv_sec directly from CLOCK_MONOTONIC_COARSE on linux at least. Right now
+   * I'm choosing to make this simpler and easier to test, but this
+   * optimization is available easily if we need it. */
+  return monotime_coarse_absolute_nsec() / ONE_BILLION;
+}
+#else /* !defined(MONOTIME_COARSE_FN_IS_DIFFERENT) */
 #define initialized_at_coarse initialized_at
 #endif /* defined(MONOTIME_COARSE_FN_IS_DIFFERENT) */
 
@@ -855,7 +885,7 @@ monotime_msec_to_approx_coarse_stamp_units(uint64_t msec)
     mach_time_info.numer;
   return abstime_val >> monotime_shift;
 }
-#else
+#else /* !defined(__APPLE__) */
 uint64_t
 monotime_coarse_stamp_units_to_approx_msec(uint64_t units)
 {
@@ -866,4 +896,4 @@ monotime_msec_to_approx_coarse_stamp_units(uint64_t msec)
 {
   return (msec * STAMP_TICKS_PER_SECOND) / 1000;
 }
-#endif
+#endif /* defined(__APPLE__) */

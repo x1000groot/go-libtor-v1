@@ -1,6 +1,6 @@
 /* Copyright (c) 2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -73,6 +73,23 @@ lzma_error_str(lzma_ret error)
       return "Unable to progress";
     case LZMA_PROG_ERROR:
       return "Programming error";
+#if LZMA_VERSION >= 50030010
+    case LZMA_SEEK_NEEDED:
+      // This can be returned by the .xz file_info decoder but with
+      // lzma_alone_decoder/encoder as we use, it should never be seen.
+      return "Seek needed";
+#endif
+#if LZMA_VERSION >= 50030020
+    case LZMA_RET_INTERNAL1:
+    case LZMA_RET_INTERNAL2:
+    case LZMA_RET_INTERNAL3:
+    case LZMA_RET_INTERNAL4:
+    case LZMA_RET_INTERNAL5:
+    case LZMA_RET_INTERNAL6:
+    case LZMA_RET_INTERNAL7:
+    case LZMA_RET_INTERNAL8:
+      FALLTHROUGH;
+#endif
     default:
       return "Unknown LZMA error";
   }
@@ -221,7 +238,7 @@ tor_lzma_compress_new(int compress,
   tor_free(result);
   return NULL;
  /* LCOV_EXCL_STOP */
-#else /* !(defined(HAVE_LZMA)) */
+#else /* !defined(HAVE_LZMA) */
   (void)compress;
   (void)method;
   (void)level;
@@ -306,13 +323,26 @@ tor_lzma_compress_process(tor_lzma_compress_state_t *state,
     case LZMA_OPTIONS_ERROR:
     case LZMA_DATA_ERROR:
     case LZMA_PROG_ERROR:
+#if LZMA_VERSION >= 50030010
+    case LZMA_SEEK_NEEDED:
+#endif
+#if LZMA_VERSION >= 50030020
+    case LZMA_RET_INTERNAL1:
+    case LZMA_RET_INTERNAL2:
+    case LZMA_RET_INTERNAL3:
+    case LZMA_RET_INTERNAL4:
+    case LZMA_RET_INTERNAL5:
+    case LZMA_RET_INTERNAL6:
+    case LZMA_RET_INTERNAL7:
+    case LZMA_RET_INTERNAL8:
+#endif
     default:
       log_warn(LD_GENERAL, "LZMA %s didn't finish: %s.",
                state->compress ? "compression" : "decompression",
                lzma_error_str(retval));
       return TOR_COMPRESS_ERROR;
   }
-#else /* !(defined(HAVE_LZMA)) */
+#else /* !defined(HAVE_LZMA) */
   (void)state;
   (void)out;
   (void)out_len;

@@ -1,5 +1,5 @@
 
-/* copyright (c) 2013-2015, The Tor Project, Inc. */
+/* copyright (c) 2013-2024, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -15,12 +15,15 @@
  *
  * The main thread informs the worker threads of pending work by using a
  * condition variable.  The workers inform the main process of completed work
- * by using an alert_sockets_t object, as implemented in compat_threads.c.
+ * by using an alert_sockets_t object, as implemented in net/alertsock.c.
  *
  * The main thread can also queue an "update" that will be handled by all the
  * workers.  This is useful for updating state that all the workers share.
  *
- * In Tor today, there is currently only one thread pool, used in cpuworker.c.
+ * In Tor today, there is currently only one thread pool, managed
+ * in cpuworker.c and handling a variety of types of work, from the original
+ * "onion skin" circuit handshakes, to consensus diff computation, to
+ * client-side onion service PoW generation.
  */
 
 #include "orconfig.h"
@@ -36,7 +39,7 @@
 #include "lib/net/socket.h"
 #include "lib/thread/threads.h"
 
-#include "tor_queue.h"
+#include "ext/tor_queue.h"
 #include <event2/event.h>
 #include <string.h>
 
@@ -44,13 +47,13 @@
 #define WORKQUEUE_PRIORITY_LAST WQ_PRI_LOW
 #define WORKQUEUE_N_PRIORITIES (((int) WORKQUEUE_PRIORITY_LAST)+1)
 
-TOR_TAILQ_HEAD(work_tailq_t, workqueue_entry_s);
+TOR_TAILQ_HEAD(work_tailq_t, workqueue_entry_t);
 typedef struct work_tailq_t work_tailq_t;
 
-struct threadpool_s {
+struct threadpool_t {
   /** An array of pointers to workerthread_t: one for each running worker
    * thread. */
-  struct workerthread_s **threads;
+  struct workerthread_t **threads;
 
   /** Condition variable that we wait on when we have no work, and which
    * gets signaled when our queue becomes nonempty. */
@@ -58,9 +61,6 @@ struct threadpool_s {
   /** Queues of pending work that we have to do. The queue with priority
    * <b>p</b> is work[p]. */
   work_tailq_t work[WORKQUEUE_N_PRIORITIES];
-
-  /** Weak RNG, used to decide when to ignore priority. */
-  tor_weak_rng_t weak_rng;
 
   /** The current 'update generation' of the threadpool.  Any thread that is
    * at an earlier generation needs to run the update function. */
@@ -95,14 +95,14 @@ struct threadpool_s {
 /** Number of bits needed to hold all legal values of workqueue_priority_t */
 #define WORKQUEUE_PRIORITY_BITS 2
 
-struct workqueue_entry_s {
+struct workqueue_entry_t {
   /** The next workqueue_entry_t that's pending on the same thread or
    * reply queue. */
-  TOR_TAILQ_ENTRY(workqueue_entry_s) next_work;
+  TOR_TAILQ_ENTRY(workqueue_entry_t) next_work;
   /** The threadpool to which this workqueue_entry_t was assigned. This field
    * is set when the workqueue_entry_t is created, and won't be cleared until
    * after it's handled in the main thread. */
-  struct threadpool_s *on_pool;
+  struct threadpool_t *on_pool;
   /** True iff this entry is waiting for a worker to start processing it. */
   uint8_t pending;
   /** Priority of this entry. */
@@ -115,22 +115,22 @@ struct workqueue_entry_s {
   void *arg;
 };
 
-struct replyqueue_s {
+struct replyqueue_t {
   /** Mutex to protect the answers field */
   tor_mutex_t lock;
   /** Doubly-linked list of answers that the reply queue needs to handle. */
-  TOR_TAILQ_HEAD(, workqueue_entry_s) answers;
+  TOR_TAILQ_HEAD(, workqueue_entry_t) answers;
 
   /** Mechanism to wake up the main thread when it is receiving answers. */
   alert_sockets_t alert;
 };
 
 /** A worker thread represents a single thread in a thread pool. */
-typedef struct workerthread_s {
+typedef struct workerthread_t {
   /** Which thread it this?  In range 0..in_pool->n_threads-1 */
   int index;
   /** The pool this thread is a part of. */
-  struct threadpool_s *in_pool;
+  struct threadpool_t *in_pool;
   /** User-supplied state field that we pass to the worker functions of each
    * work item. */
   void *state;
@@ -143,6 +143,8 @@ typedef struct workerthread_s {
 } workerthread_t;
 
 static void queue_reply(replyqueue_t *queue, workqueue_entry_t *work);
+static void workerthread_free(workerthread_t *thread);
+static void replyqueue_free(replyqueue_t *queue);
 
 /** Allocate and return a new workqueue_entry_t, set up to run the function
  * <b>fn</b> in the worker thread, and <b>reply_fn</b> in the main
@@ -238,7 +240,7 @@ worker_thread_extract_next_work(workerthread_t *thread)
     this_queue = &pool->work[i];
     if (!TOR_TAILQ_EMPTY(this_queue)) {
       queue = this_queue;
-      if (! tor_weak_random_one_in_n(&pool->weak_rng,
+      if (! crypto_fast_rng_one_in_n(get_thread_fast_rng(),
                                      thread->lower_priority_chance)) {
         /* Usually we'll just break now, so that we can get out of the loop
          * and use the queue where we found work. But with a small
@@ -355,12 +357,21 @@ workerthread_new(int32_t lower_priority_chance,
     //LCOV_EXCL_START
     tor_assert_nonfatal_unreached();
     log_err(LD_GENERAL, "Can't launch worker thread.");
-    tor_free(thr);
+    workerthread_free(thr);
     return NULL;
     //LCOV_EXCL_STOP
   }
 
   return thr;
+}
+
+/**
+ * Free up the resources allocated by a worker thread.
+ */
+static void
+workerthread_free(workerthread_t *thread)
+{
+  tor_free(thread);
 }
 
 /**
@@ -555,11 +566,6 @@ threadpool_new(int n_threads,
   for (i = WORKQUEUE_PRIORITY_FIRST; i <= WORKQUEUE_PRIORITY_LAST; ++i) {
     TOR_TAILQ_INIT(&pool->work[i]);
   }
-  {
-    unsigned seed;
-    crypto_rand((void*)&seed, sizeof(seed));
-    tor_init_weak_random(&pool->weak_rng, seed);
-  }
 
   pool->new_thread_state_fn = new_thread_state_fn;
   pool->new_thread_state_arg = arg;
@@ -571,12 +577,45 @@ threadpool_new(int n_threads,
     tor_assert_nonfatal_unreached();
     tor_cond_uninit(&pool->condition);
     tor_mutex_uninit(&pool->lock);
-    tor_free(pool);
+    threadpool_free(pool);
     return NULL;
     //LCOV_EXCL_STOP
   }
 
   return pool;
+}
+
+/**
+ * Free up the resources allocated by worker threads, worker thread pool, ...
+ */
+void
+threadpool_free(threadpool_t *pool)
+{
+  if (!pool)
+    return;
+
+  if (pool->threads) {
+    for (int i = 0; i != pool->n_threads; ++i)
+      workerthread_free(pool->threads[i]);
+
+    tor_free(pool->threads);
+  }
+
+  if (pool->update_args)
+    pool->free_update_arg_fn(pool->update_args);
+
+  if (pool->reply_event) {
+    tor_event_del(pool->reply_event);
+    tor_event_free(pool->reply_event);
+  }
+
+  if (pool->reply_queue)
+    replyqueue_free(pool->reply_queue);
+
+  if (pool->new_thread_state_arg)
+    pool->free_thread_state_fn(pool->new_thread_state_arg);
+
+  tor_free(pool);
 }
 
 /** Return the reply queue associated with a given thread pool. */
@@ -598,7 +637,7 @@ replyqueue_new(uint32_t alertsocks_flags)
   rq = tor_malloc_zero(sizeof(replyqueue_t));
   if (alert_sockets_create(&rq->alert, alertsocks_flags) < 0) {
     //LCOV_EXCL_START
-    tor_free(rq);
+    replyqueue_free(rq);
     return NULL;
     //LCOV_EXCL_STOP
   }
@@ -607,6 +646,26 @@ replyqueue_new(uint32_t alertsocks_flags)
   TOR_TAILQ_INIT(&rq->answers);
 
   return rq;
+}
+
+/**
+ * Free up the resources allocated by a reply queue.
+ */
+static void
+replyqueue_free(replyqueue_t *queue)
+{
+  if (!queue)
+    return;
+
+  workqueue_entry_t *work;
+
+  while (!TOR_TAILQ_EMPTY(&queue->answers)) {
+    work = TOR_TAILQ_FIRST(&queue->answers);
+    TOR_TAILQ_REMOVE(&queue->answers, work, next_work);
+    workqueue_entry_free(work);
+  }
+
+  tor_free(queue);
 }
 
 /** Internal: Run from the libevent mainloop when there is work to handle in
@@ -622,8 +681,8 @@ reply_event_cb(evutil_socket_t sock, short events, void *arg)
     tp->reply_cb(tp);
 }
 
-/** Register the threadpool <b>tp</b>'s reply queue with the libevent
- * mainloop of <b>base</b>. If <b>tp</b> is provided, it is run after
+/** Register the threadpool <b>tp</b>'s reply queue with Tor's global
+ * libevent mainloop. If <b>cb</b> is provided, it is run after
  * each time there is work to process from the reply queue. Return 0 on
  * success, -1 on failure.
  */
@@ -679,4 +738,12 @@ replyqueue_process(replyqueue_t *queue)
   }
 
   tor_mutex_release(&queue->lock);
+}
+
+/** Return the number of threads configured for the given pool. */
+unsigned int
+threadpool_get_n_threads(threadpool_t *tp)
+{
+  tor_assert(tp);
+  return tp->n_threads;
 }

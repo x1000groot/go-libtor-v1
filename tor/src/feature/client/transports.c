@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2019, The Tor Project, Inc. */
+/* Copyright (c) 2011-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -16,7 +16,7 @@
  * managed proxies that are still unconfigured.
  *
  * In every run_scheduled_event() tick, we attempt to launch and then
- * configure the unconfiged managed proxies, using the configuration
+ * configure the unconfigured managed proxies, using the configuration
  * protocol defined in the 180_pluggable_transport.txt proposal. A
  * managed proxy might need several ticks to get fully configured.
  *
@@ -71,7 +71,7 @@
  *
  * We then start parsing torrc again.
  *
- * Everytime we encounter a transport line using a managed proxy that
+ * Every time we encounter a transport line using a managed proxy that
  * was around before the config read, we cleanse that proxy from the
  * removal mark.  We also toggle the <b>check_if_restarts_needed</b>
  * flag, so that on the next <b>pt_configure_remaining_proxies</b>
@@ -89,6 +89,7 @@
  * old transports from the circuitbuild.c subsystem.
  **/
 
+#include "lib/string/printf.h"
 #define PT_PRIVATE
 #include "core/or/or.h"
 #include "feature/client/bridges.h"
@@ -97,15 +98,20 @@
 #include "core/or/circuitbuild.h"
 #include "feature/client/transports.h"
 #include "feature/relay/router.h"
+#include "feature/relay/relay_find_addr.h"
+/* 31851: split the server transport code out of the client module */
+#include "feature/relay/transport_config.h"
 #include "app/config/statefile.h"
 #include "core/or/connection_or.h"
 #include "feature/relay/ext_orport.h"
-#include "feature/control/control.h"
+#include "feature/control/control_events.h"
+#include "lib/encoding/confline.h"
+#include "lib/encoding/kvline.h"
 
+#include "lib/process/process.h"
 #include "lib/process/env.h"
-#include "lib/process/subprocess.h"
 
-static process_environment_t *
+static smartlist_t *
 create_managed_proxy_environment(const managed_proxy_t *mp);
 
 static inline int proxy_configuration_finished(const managed_proxy_t *mp);
@@ -127,6 +133,8 @@ static void parse_method_error(const char *line, int is_server_method);
 #define PROTO_SMETHODS_DONE "SMETHODS DONE"
 #define PROTO_PROXY_DONE "PROXY DONE"
 #define PROTO_PROXY_ERROR "PROXY-ERROR"
+#define PROTO_LOG "LOG"
+#define PROTO_STATUS "STATUS"
 
 /** The first and only supported - at the moment - configuration
     protocol version. */
@@ -361,6 +369,28 @@ static int unconfigured_proxies_n = 0;
 /** Boolean: True iff we might need to restart some proxies. */
 static int check_if_restarts_needed = 0;
 
+/** Return true iff we have a managed_proxy_t in the global list is for the
+ * given transport name. */
+bool
+managed_proxy_has_transport(const char *transport_name)
+{
+  tor_assert(transport_name);
+
+  if (!managed_proxy_list) {
+    return false;
+  }
+
+  SMARTLIST_FOREACH_BEGIN(managed_proxy_list, const managed_proxy_t *, mp) {
+    SMARTLIST_FOREACH_BEGIN(mp->transports_to_launch, const char *, name) {
+      if (!strcasecmp(name, transport_name)) {
+        return true;
+      }
+    } SMARTLIST_FOREACH_END(name);
+  } SMARTLIST_FOREACH_END(mp);
+
+  return false;
+}
+
 /** Return true if there are still unconfigured managed proxies, or proxies
  * that need restarting. */
 int
@@ -490,8 +520,10 @@ proxy_prepare_for_restart(managed_proxy_t *mp)
   tor_assert(mp->conf_state == PT_PROTO_COMPLETED);
 
   /* destroy the process handle and terminate the process. */
-  tor_process_handle_destroy(mp->process_handle, 1);
-  mp->process_handle = NULL;
+  if (mp->process) {
+    process_set_data(mp->process, NULL);
+    process_terminate(mp->process);
+  }
 
   /* destroy all its registered transports, since we will no longer
      use them. */
@@ -512,7 +544,7 @@ proxy_prepare_for_restart(managed_proxy_t *mp)
   mp->proxy_supported = 0;
 
   /* flag it as an infant proxy so that it gets launched on next tick */
-  mp->conf_state = PT_PROTO_INFANT;
+  managed_proxy_set_state(mp, PT_PROTO_INFANT);
   unconfigured_proxies_n++;
 }
 
@@ -520,35 +552,38 @@ proxy_prepare_for_restart(managed_proxy_t *mp)
 static int
 launch_managed_proxy(managed_proxy_t *mp)
 {
-  int retval;
+  tor_assert(mp);
 
-  process_environment_t *env = create_managed_proxy_environment(mp);
+  smartlist_t *env = create_managed_proxy_environment(mp);
 
-#ifdef _WIN32
-  /* Passing NULL as lpApplicationName makes Windows search for the .exe */
-  retval = tor_spawn_background(NULL,
-                                (const char **)mp->argv,
-                                env,
-                                &mp->process_handle);
-#else /* !(defined(_WIN32)) */
-  retval = tor_spawn_background(mp->argv[0],
-                                (const char **)mp->argv,
-                                env,
-                                &mp->process_handle);
-#endif /* defined(_WIN32) */
+  /* Configure our process. */
+  tor_assert(mp->process == NULL);
+  mp->process = process_new(mp->argv[0]);
+  process_set_data(mp->process, mp);
+  process_set_stdout_read_callback(mp->process, managed_proxy_stdout_callback);
+  process_set_stderr_read_callback(mp->process, managed_proxy_stderr_callback);
+  process_set_exit_callback(mp->process, managed_proxy_exit_callback);
+  process_set_protocol(mp->process, PROCESS_PROTOCOL_LINE);
+  process_reset_environment(mp->process, env);
 
-  process_environment_free(env);
+  /* Cleanup our env. */
+  SMARTLIST_FOREACH(env, char *, x, tor_free(x));
+  smartlist_free(env);
 
-  if (retval == PROCESS_STATUS_ERROR) {
-    log_warn(LD_GENERAL, "Managed proxy at '%s' failed at launch.",
+  /* Skip the argv[0] as we get that from process_new(argv[0]). */
+  for (int i = 1; mp->argv[i] != NULL; ++i)
+    process_append_argument(mp->process, mp->argv[i]);
+
+  if (process_exec(mp->process) != PROCESS_STATUS_RUNNING) {
+    log_warn(LD_CONFIG, "Managed proxy at '%s' failed at launch.",
              mp->argv[0]);
     return -1;
   }
 
-  log_info(LD_CONFIG, "Managed proxy at '%s' has spawned with PID '%d'.",
-           mp->argv[0], tor_process_get_pid(mp->process_handle));
-
-  mp->conf_state = PT_PROTO_LAUNCHED;
+  log_info(LD_CONFIG,
+           "Managed proxy at '%s' has spawned with PID '%" PRIu64 "'.",
+           mp->argv[0], process_get_pid(mp->process));
+  managed_proxy_set_state(mp, PT_PROTO_LAUNCHED);
 
   return 0;
 }
@@ -615,59 +650,18 @@ pt_configure_remaining_proxies(void)
 STATIC int
 configure_proxy(managed_proxy_t *mp)
 {
-  int configuration_finished = 0;
-  smartlist_t *proxy_output = NULL;
-  enum stream_status stream_status = 0;
-
   /* if we haven't launched the proxy yet, do it now */
   if (mp->conf_state == PT_PROTO_INFANT) {
     if (launch_managed_proxy(mp) < 0) { /* launch fail */
-      mp->conf_state = PT_PROTO_FAILED_LAUNCH;
+      managed_proxy_set_state(mp, PT_PROTO_FAILED_LAUNCH);
       handle_finished_proxy(mp);
     }
     return 0;
   }
 
   tor_assert(mp->conf_state != PT_PROTO_INFANT);
-  tor_assert(mp->process_handle);
-
-  proxy_output =
-    tor_get_lines_from_handle(tor_process_get_stdout_pipe(mp->process_handle),
-                              &stream_status);
-  if (!proxy_output) { /* failed to get input from proxy */
-    if (stream_status != IO_STREAM_EAGAIN) { /* bad stream status! */
-      mp->conf_state = PT_PROTO_BROKEN;
-      log_warn(LD_GENERAL, "The communication stream of managed proxy '%s' "
-               "is '%s'. Most probably the managed proxy stopped running. "
-               "This might be a bug of the managed proxy, a bug of Tor, or "
-               "a misconfiguration. Please enable logging on your managed "
-               "proxy and check the logs for errors.",
-               mp->argv[0], stream_status_to_string(stream_status));
-    }
-
-    goto done;
-  }
-
-  /* Handle lines. */
-  SMARTLIST_FOREACH_BEGIN(proxy_output, const char *, line) {
-    handle_proxy_line(line, mp);
-    if (proxy_configuration_finished(mp))
-      goto done;
-  } SMARTLIST_FOREACH_END(line);
-
- done:
-  /* if the proxy finished configuring, exit the loop. */
-  if (proxy_configuration_finished(mp)) {
-    handle_finished_proxy(mp);
-    configuration_finished = 1;
-  }
-
-  if (proxy_output) {
-    SMARTLIST_FOREACH(proxy_output, char *, cp, tor_free(cp));
-    smartlist_free(proxy_output);
-  }
-
-  return configuration_finished;
+  tor_assert(mp->process);
+  return mp->conf_state == PT_PROTO_COMPLETED;
 }
 
 /** Register server managed proxy <b>mp</b> transports to state */
@@ -748,8 +742,18 @@ managed_proxy_destroy(managed_proxy_t *mp,
   /* free the outgoing proxy URI */
   tor_free(mp->proxy_uri);
 
-  tor_process_handle_destroy(mp->process_handle, also_terminate_process);
-  mp->process_handle = NULL;
+  /* free our version, if any is set. */
+  tor_free(mp->version);
+  tor_free(mp->implementation);
+
+  /* do we want to terminate our process if it's still running? */
+  if (also_terminate_process && mp->process) {
+    /* Note that we do not call process_free(mp->process) here because we let
+     * the exit handler in managed_proxy_exit_callback() return `true` which
+     * makes the process subsystem deallocate the process_t. */
+    process_set_data(mp->process, NULL);
+    process_terminate(mp->process);
+  }
 
   tor_free(mp);
 }
@@ -763,6 +767,9 @@ get_pt_proxy_uri(void)
   const or_options_t *options = get_options();
   char *uri = NULL;
 
+  /* XXX: Currently TCPProxy is not supported in TOR_PT_PROXY because
+   * there isn't a standard URI scheme for some proxy protocols, such as
+   * haproxy. */
   if (options->Socks4Proxy || options->Socks5Proxy || options->HTTPSProxy) {
     char addr[TOR_ADDR_BUF_LEN+1];
 
@@ -812,8 +819,12 @@ handle_finished_proxy(managed_proxy_t *mp)
       managed_proxy_destroy(mp, 1); /* annihilate it. */
       break;
     }
-    register_proxy(mp); /* register its transports */
-    mp->conf_state = PT_PROTO_COMPLETED; /* and mark it as completed. */
+
+    /* register its transports */
+    register_proxy(mp);
+
+    /* and mark it as completed. */
+    managed_proxy_set_state(mp, PT_PROTO_COMPLETED);
     break;
   case PT_PROTO_INFANT:
   case PT_PROTO_LAUNCHED:
@@ -845,7 +856,7 @@ handle_methods_done(const managed_proxy_t *mp)
   tor_assert(mp->transports);
 
   if (smartlist_len(mp->transports) == 0)
-    log_notice(LD_GENERAL, "Managed proxy '%s' was spawned successfully, "
+    log_warn(LD_GENERAL, "Managed proxy '%s' was spawned successfully, "
                "but it didn't launch any pluggable transport listeners!",
                mp->argv[0]);
 
@@ -859,7 +870,7 @@ handle_methods_done(const managed_proxy_t *mp)
 STATIC void
 handle_proxy_line(const char *line, managed_proxy_t *mp)
 {
-  log_info(LD_GENERAL, "Got a line from managed proxy '%s': (%s)",
+  log_info(LD_PT, "Got a line from managed proxy '%s': (%s)",
            mp->argv[0], line);
 
   if (!strcmpstart(line, PROTO_ENV_ERROR)) {
@@ -883,7 +894,7 @@ handle_proxy_line(const char *line, managed_proxy_t *mp)
       goto err;
 
     tor_assert(mp->conf_protocol != 0);
-    mp->conf_state = PT_PROTO_ACCEPTING_METHODS;
+    managed_proxy_set_state(mp, PT_PROTO_ACCEPTING_METHODS);
     return;
   } else if (!strcmpstart(line, PROTO_CMETHODS_DONE)) {
     if (mp->conf_state != PT_PROTO_ACCEPTING_METHODS)
@@ -891,7 +902,7 @@ handle_proxy_line(const char *line, managed_proxy_t *mp)
 
     handle_methods_done(mp);
 
-    mp->conf_state = PT_PROTO_CONFIGURED;
+    managed_proxy_set_state(mp, PT_PROTO_CONFIGURED);
     return;
   } else if (!strcmpstart(line, PROTO_SMETHODS_DONE)) {
     if (mp->conf_state != PT_PROTO_ACCEPTING_METHODS)
@@ -899,20 +910,28 @@ handle_proxy_line(const char *line, managed_proxy_t *mp)
 
     handle_methods_done(mp);
 
-    mp->conf_state = PT_PROTO_CONFIGURED;
+    managed_proxy_set_state(mp, PT_PROTO_CONFIGURED);
     return;
   } else if (!strcmpstart(line, PROTO_CMETHOD_ERROR)) {
     if (mp->conf_state != PT_PROTO_ACCEPTING_METHODS)
       goto err;
 
+    /* Log the error but do not kill the managed proxy.
+     * A proxy may contain several transports and if one
+     * of them is misconfigured, we still want to use
+     * the other transports. A managed proxy with no usable
+     * transports will log a warning.
+     * See https://gitlab.torproject.org/tpo/core/tor/-/issues/7362
+     * */
     parse_client_method_error(line);
-    goto err;
+    return;
   } else if (!strcmpstart(line, PROTO_SMETHOD_ERROR)) {
     if (mp->conf_state != PT_PROTO_ACCEPTING_METHODS)
       goto err;
 
+    /* Log the error but do not kill the managed proxy */
     parse_server_method_error(line);
-    goto err;
+    return;
   } else if (!strcmpstart(line, PROTO_CMETHOD)) {
     if (mp->conf_state != PT_PROTO_ACCEPTING_METHODS)
       goto err;
@@ -945,21 +964,16 @@ handle_proxy_line(const char *line, managed_proxy_t *mp)
 
     parse_proxy_error(line);
     goto err;
-  } else if (!strcmpstart(line, SPAWN_ERROR_MESSAGE)) {
-    /* managed proxy launch failed: parse error message to learn why. */
-    int retval, child_state, saved_errno;
-    retval = tor_sscanf(line, SPAWN_ERROR_MESSAGE "%x/%x",
-                        &child_state, &saved_errno);
-    if (retval == 2) {
-      log_warn(LD_GENERAL,
-               "Could not launch managed proxy executable at '%s' ('%s').",
-               mp->argv[0], strerror(saved_errno));
-    } else { /* failed to parse error message */
-      log_warn(LD_GENERAL,"Could not launch managed proxy executable at '%s'.",
-               mp->argv[0]);
-    }
 
-    mp->conf_state = PT_PROTO_FAILED_LAUNCH;
+    /* We check for the additional " " after the PROTO_LOG * PROTO_STATUS
+     * string to make sure we can later extend this big if/else-if table with
+     * something that begins with "LOG" without having to get the order right.
+     * */
+  } else if (!strcmpstart(line, PROTO_LOG " ")) {
+    parse_log_line(line, mp);
+    return;
+  } else if (!strcmpstart(line, PROTO_STATUS " ")) {
+    parse_status_line(line, mp);
     return;
   }
 
@@ -967,7 +981,7 @@ handle_proxy_line(const char *line, managed_proxy_t *mp)
   return;
 
  err:
-  mp->conf_state = PT_PROTO_BROKEN;
+  managed_proxy_set_state(mp, PT_PROTO_BROKEN);
   log_warn(LD_CONFIG, "Managed proxy at '%s' failed the configuration protocol"
            " and will be destroyed.", mp->argv[0]);
 }
@@ -1182,6 +1196,160 @@ parse_proxy_error(const char *line)
            line+strlen(PROTO_PROXY_ERROR)+1);
 }
 
+/** Parses a LOG <b>line</b> and emit log events accordingly. */
+STATIC void
+parse_log_line(const char *line, managed_proxy_t *mp)
+{
+  tor_assert(line);
+  tor_assert(mp);
+
+  config_line_t *values = NULL;
+  char *log_message = NULL;
+
+  if (strlen(line) < (strlen(PROTO_LOG) + 1)) {
+    log_warn(LD_PT, "Managed proxy sent us a %s line "
+                    "with missing argument.", PROTO_LOG);
+    goto done;
+  }
+
+  const char *data = line + strlen(PROTO_LOG) + 1;
+  values = kvline_parse(data, KV_QUOTED);
+
+  if (! values) {
+    log_warn(LD_PT, "Managed proxy \"%s\" wrote an invalid LOG message: %s",
+             mp->argv[0], data);
+    goto done;
+  }
+
+  const config_line_t *severity = config_line_find(values, "SEVERITY");
+  const config_line_t *message = config_line_find(values, "MESSAGE");
+
+  /* Check if we got a message. */
+  if (! message) {
+    log_warn(LD_PT, "Managed proxy \"%s\" wrote a LOG line without "
+                    "MESSAGE: %s", mp->argv[0], escaped(data));
+    goto done;
+  }
+
+  /* Check if severity is there and whether it's valid. */
+  if (! severity) {
+    log_warn(LD_PT, "Managed proxy \"%s\" wrote a LOG line without "
+                    "SEVERITY: %s", mp->argv[0], escaped(data));
+    goto done;
+  }
+
+  int log_severity = managed_proxy_severity_parse(severity->value);
+
+  if (log_severity == -1) {
+    log_warn(LD_PT, "Managed proxy \"%s\" wrote a LOG line with an "
+                    "invalid severity level: %s",
+                    mp->argv[0], severity->value);
+    goto done;
+  }
+
+  tor_log(log_severity, LD_PT, "Managed proxy \"%s\": %s",
+          mp->argv[0], message->value);
+
+  /* Prepend the PT name. */
+  config_line_prepend(&values, "PT", mp->argv[0]);
+  log_message = kvline_encode(values, KV_QUOTED);
+
+  /* Emit control port event. */
+  control_event_pt_log(log_message);
+
+ done:
+  config_free_lines(values);
+  tor_free(log_message);
+}
+
+/** Parses a STATUS <b>line</b> and emit control events accordingly. */
+STATIC void
+parse_status_line(const char *line, managed_proxy_t *mp)
+{
+  tor_assert(line);
+  tor_assert(mp);
+
+  config_line_t *values = NULL;
+  char *status_message = NULL;
+
+  if (strlen(line) < (strlen(PROTO_STATUS) + 1)) {
+    log_warn(LD_PT, "Managed proxy sent us a %s line "
+                    "with missing argument.", PROTO_STATUS);
+    goto done;
+  }
+
+  const char *data = line + strlen(PROTO_STATUS) + 1;
+
+  values = kvline_parse(data, KV_QUOTED);
+
+  if (! values) {
+    log_warn(LD_PT, "Managed proxy \"%s\" wrote an invalid "
+             "STATUS message: %s", mp->argv[0], escaped(data));
+    goto done;
+  }
+
+  /* Handle the different messages. */
+  handle_status_message(values, mp);
+
+  /* Prepend the PT name. */
+  config_line_prepend(&values, "PT", mp->argv[0]);
+  status_message = kvline_encode(values, KV_QUOTED);
+
+  /* We have checked that TRANSPORT is there, we can now emit the STATUS event
+   * via the control port. */
+  control_event_pt_status(status_message);
+
+ done:
+  config_free_lines(values);
+  tor_free(status_message);
+}
+
+STATIC void
+handle_status_message(const config_line_t *values,
+                      managed_proxy_t *mp)
+{
+  if (config_count_key(values, "TYPE") > 1) {
+      log_warn(LD_PT, "Managed proxy \"%s\" has multiple TYPE key which "
+                      "is not allowed.", mp->argv[0]);
+      return;
+  }
+  const config_line_t *message_type = config_line_find(values, "TYPE");
+
+  /* Check if we have a TYPE field? */
+  if (message_type == NULL) {
+    log_debug(LD_PT, "Managed proxy \"%s\" wrote a STATUS line without "
+                     "a defined message TYPE", mp->argv[0]);
+    return;
+  }
+
+  /* Handle VERSION messages. */
+  if (! strcasecmp(message_type->value, "version")) {
+    const config_line_t *version = config_line_find(values, "VERSION");
+    const config_line_t *implementation = config_line_find(values,
+                                                           "IMPLEMENTATION");
+
+    if (version == NULL) {
+      log_warn(LD_PT, "Managed proxy \"%s\" wrote a STATUS TYPE=version line "
+                      "with a missing VERSION field", mp->argv[0]);
+      return;
+    }
+
+    if (implementation == NULL) {
+      log_warn(LD_PT, "Managed proxy \"%s\" wrote a STATUS TYPE=version line "
+                      "with a missing IMPLEMENTATION field", mp->argv[0]);
+      return;
+    }
+
+    tor_free(mp->version);
+    mp->version = tor_strdup(version->value);
+
+    tor_free(mp->implementation);
+    mp->implementation = tor_strdup(implementation->value);
+
+    return;
+  }
+}
+
 /** Return a newly allocated string that tor should place in
  * TOR_PT_SERVER_TRANSPORT_OPTIONS while configuring the server
  * manged proxy in <b>mp</b>. Return NULL if no such options are found. */
@@ -1199,7 +1367,7 @@ get_transport_options_for_server_proxy(const managed_proxy_t *mp)
       string. */
   SMARTLIST_FOREACH_BEGIN(mp->transports_to_launch, const char *, transport) {
     smartlist_t *options_tmp_sl = NULL;
-    options_tmp_sl = get_options_for_server_transport(transport);
+    options_tmp_sl = pt_get_options_for_server_transport(transport);
     if (!options_tmp_sl)
       continue;
 
@@ -1257,7 +1425,7 @@ get_bindaddr_for_server_proxy(const managed_proxy_t *mp)
 
 /** Return a newly allocated process_environment_t * for <b>mp</b>'s
  * process. */
-static process_environment_t *
+static smartlist_t *
 create_managed_proxy_environment(const managed_proxy_t *mp)
 {
   const or_options_t *options = get_options();
@@ -1271,8 +1439,6 @@ create_managed_proxy_environment(const managed_proxy_t *mp)
 
   /* The final environment to be passed to mp. */
   smartlist_t *merged_env_vars = get_current_process_environment_variables();
-
-  process_environment_t *env;
 
   {
     char *state_tmp = get_datadir_fname("pt_state/"); /* XXX temp */
@@ -1337,8 +1503,10 @@ create_managed_proxy_environment(const managed_proxy_t *mp)
         smartlist_add_asprintf(envs, "TOR_PT_EXTENDED_SERVER_PORT=%s",
                                ext_or_addrport_tmp);
       }
-      smartlist_add_asprintf(envs, "TOR_PT_AUTH_COOKIE_FILE=%s",
-                             cookie_file_loc);
+      if (cookie_file_loc) {
+        smartlist_add_asprintf(envs, "TOR_PT_AUTH_COOKIE_FILE=%s",
+                               cookie_file_loc);
+      }
 
       tor_free(ext_or_addrport_tmp);
       tor_free(cookie_file_loc);
@@ -1346,11 +1514,6 @@ create_managed_proxy_environment(const managed_proxy_t *mp)
     } else {
       smartlist_add_asprintf(envs, "TOR_PT_EXTENDED_SERVER_PORT=");
     }
-
-    /* All new versions of tor will keep stdin open, so PTs can use it
-     * as a reliable termination detection mechanism.
-     */
-    smartlist_add_asprintf(envs, "TOR_PT_EXIT_ON_STDIN_CLOSE=1");
   } else {
     /* If ClientTransportPlugin has a HTTPS/SOCKS proxy configured, set the
      * TOR_PT_PROXY line.
@@ -1361,19 +1524,50 @@ create_managed_proxy_environment(const managed_proxy_t *mp)
     }
   }
 
+  /* All new versions of tor will keep stdin open, so PTs can use it
+   * as a reliable termination detection mechanism.
+   */
+  smartlist_add_asprintf(envs, "TOR_PT_EXIT_ON_STDIN_CLOSE=1");
+
+  /* Specify which IPv4 and IPv6 addresses the PT should make its outgoing
+   * connections from. See: https://bugs.torproject.org/5304 for more
+   * information about this. */
+  {
+    /* Set TOR_PT_OUTBOUND_BIND_ADDRESS_V4. */
+    const tor_addr_t *ipv4_addr = managed_proxy_outbound_address(options,
+                                                                 AF_INET);
+
+    /* managed_proxy_outbound_address() only returns a non-NULL value if
+     * tor_addr_is_null() was false, which means we don't have to check that
+     * here. */
+    if (ipv4_addr) {
+      char *ipv4_addr_str = tor_addr_to_str_dup(ipv4_addr);
+      smartlist_add_asprintf(envs,
+                             "TOR_PT_OUTBOUND_BIND_ADDRESS_V4=%s",
+                             ipv4_addr_str);
+      tor_free(ipv4_addr_str);
+    }
+
+    /* Set TOR_PT_OUTBOUND_BIND_ADDRESS_V6. */
+    const tor_addr_t *ipv6_addr = managed_proxy_outbound_address(options,
+                                                                 AF_INET6);
+    if (ipv6_addr) {
+      char *ipv6_addr_str = tor_addr_to_str_dup(ipv6_addr);
+      smartlist_add_asprintf(envs,
+                             "TOR_PT_OUTBOUND_BIND_ADDRESS_V6=[%s]",
+                             ipv6_addr_str);
+      tor_free(ipv6_addr_str);
+    }
+  }
+
   SMARTLIST_FOREACH_BEGIN(envs, const char *, env_var) {
     set_environment_variable_in_smartlist(merged_env_vars, env_var,
                                           tor_free_, 1);
   } SMARTLIST_FOREACH_END(env_var);
 
-  env = process_environment_make(merged_env_vars);
-
   smartlist_free(envs);
 
-  SMARTLIST_FOREACH(merged_env_vars, void *, x, tor_free(x));
-  smartlist_free(merged_env_vars);
-
-  return env;
+  return merged_env_vars;
 }
 
 /** Create and return a new managed proxy for <b>transport</b> using
@@ -1387,11 +1581,14 @@ managed_proxy_create(const smartlist_t *with_transport_list,
                      char **proxy_argv, int is_server)
 {
   managed_proxy_t *mp = tor_malloc_zero(sizeof(managed_proxy_t));
-  mp->conf_state = PT_PROTO_INFANT;
+  managed_proxy_set_state(mp, PT_PROTO_INFANT);
   mp->is_server = is_server;
   mp->argv = proxy_argv;
   mp->transports = smartlist_new();
   mp->proxy_uri = get_pt_proxy_uri();
+
+  /* Gets set in launch_managed_proxy(). */
+  mp->process = NULL;
 
   mp->transports_to_launch = smartlist_new();
   SMARTLIST_FOREACH(with_transport_list, const char *, transport,
@@ -1561,17 +1758,26 @@ pt_get_extra_info_descriptor_string(void)
 
     SMARTLIST_FOREACH_BEGIN(mp->transports, const transport_t *, t) {
       char *transport_args = NULL;
+      const char *addrport = NULL;
 
       /* If the transport proxy returned "0.0.0.0" as its address, and
        * we know our external IP address, use it. Otherwise, use the
        * returned address. */
-      const char *addrport = NULL;
-      uint32_t external_ip_address = 0;
-      if (tor_addr_is_null(&t->addr) &&
-          router_pick_published_address(get_options(),
-                                        &external_ip_address, 0) >= 0) {
+      if (tor_addr_is_null(&t->addr)) {
         tor_addr_t addr;
-        tor_addr_from_ipv4h(&addr, external_ip_address);
+        /* Attempt to find the IPv4 and then attempt to find the IPv6 if we
+         * can't find it. */
+        bool found = relay_find_addr_to_publish(get_options(), AF_INET,
+                                                RELAY_FIND_ADDR_NO_FLAG,
+                                                &addr);
+        if (!found) {
+          found = relay_find_addr_to_publish(get_options(), AF_INET6,
+                                             RELAY_FIND_ADDR_NO_FLAG, &addr);
+        }
+        if (!found) {
+          log_err(LD_PT, "Unable to find address for transport %s", t->name);
+          continue;
+        }
         addrport = fmt_addrport(&addr, t->port);
       } else {
         addrport = fmt_addrport(&t->addr, t->port);
@@ -1586,9 +1792,28 @@ pt_get_extra_info_descriptor_string(void)
                              "transport %s %s%s",
                              t->name, addrport,
                              transport_args ? transport_args : "");
+
       tor_free(transport_args);
     } SMARTLIST_FOREACH_END(t);
 
+    /* Set transport-info line. */
+    {
+      char *version = NULL;
+      char *impl = NULL;
+
+      if (mp->version) {
+        tor_asprintf(&version, " version=%s", mp->version);
+      }
+      if (mp->implementation) {
+        tor_asprintf(&impl, " implementation=%s", mp->implementation);
+      }
+      /* Always put in the line even if empty. Else, we don't know to which
+       * transport this applies to. */
+      smartlist_add_asprintf(string_chunks, "transport-info%s%s",
+                             version ? version: "", impl ? impl: "");
+      tor_free(version);
+      tor_free(impl);
+    }
   } SMARTLIST_FOREACH_END(mp);
 
   if (smartlist_len(string_chunks) == 0) {
@@ -1735,4 +1960,196 @@ tor_escape_str_for_pt_args(const char *string, const char *chars_to_escape)
   *new_cp = '\0'; /* NUL-terminate the new string */
 
   return new_string;
+}
+
+/** Callback function that is called when our PT process have data on its
+ * stdout. Our process can be found in <b>process</b>, the data can be found in
+ * <b>line</b> and the length of our line is given in <b>size</b>. */
+STATIC void
+managed_proxy_stdout_callback(process_t *process,
+                              const char *line,
+                              size_t size)
+{
+  tor_assert(process);
+  tor_assert(line);
+
+  (void)size;
+
+  managed_proxy_t *mp = process_get_data(process);
+
+  if (mp == NULL)
+    return;
+
+  handle_proxy_line(line, mp);
+
+  if (proxy_configuration_finished(mp))
+    handle_finished_proxy(mp);
+}
+
+/** Callback function that is called when our PT process have data on its
+ * stderr. Our process can be found in <b>process</b>, the data can be found in
+ * <b>line</b> and the length of our line is given in <b>size</b>. */
+STATIC void
+managed_proxy_stderr_callback(process_t *process,
+                              const char *line,
+                              size_t size)
+{
+  tor_assert(process);
+  tor_assert(line);
+
+  (void)size;
+
+  managed_proxy_t *mp = process_get_data(process);
+
+  if (BUG(mp == NULL))
+    return;
+
+  log_info(LD_PT,
+           "Managed proxy at '%s' reported via standard error: %s",
+           mp->argv[0], line);
+}
+
+/** Callback function that is called when our PT process terminates. The
+ * process exit code can be found in <b>exit_code</b> and our process can be
+ * found in <b>process</b>. Returns true iff we want the process subsystem to
+ * free our process_t handle for us. */
+STATIC bool
+managed_proxy_exit_callback(process_t *process, process_exit_code_t exit_code)
+{
+  tor_assert(process);
+
+  managed_proxy_t *mp = process_get_data(process);
+  const char *name = mp ? mp->argv[0] : "N/A";
+
+  log_warn(LD_PT,
+          "Managed proxy \"%s\" process terminated with status code %" PRIu64,
+          name, exit_code);
+
+  if (mp) {
+    /* We remove this process_t from the mp. */
+    tor_assert(mp->process == process);
+    mp->process = NULL;
+
+    /* Prepare the proxy for restart. */
+    proxy_prepare_for_restart(mp);
+
+    /* We have proxies we want to restart? */
+    pt_configure_remaining_proxies();
+  }
+
+  /* Returning true here means that the process subsystem will take care of
+   * calling process_free() on our process_t. */
+  return true;
+}
+
+/** Returns a valid integer log severity level from <b>severity</b> that
+ * is compatible with Tor's logging functions. Returns <b>-1</b> on
+ * error. */
+STATIC int
+managed_proxy_severity_parse(const char *severity)
+{
+  tor_assert(severity);
+
+  /* Slightly different than log.c's parse_log_level :-( */
+  if (! strcmp(severity, "debug"))
+    return LOG_DEBUG;
+
+  if (! strcmp(severity, "info"))
+    return LOG_INFO;
+
+  if (! strcmp(severity, "notice"))
+    return LOG_NOTICE;
+
+  if (! strcmp(severity, "warning"))
+    return LOG_WARN;
+
+  if (! strcmp(severity, "error"))
+    return LOG_ERR;
+
+  return -1;
+}
+
+/** Return the outbound address from the given <b>family</b>. Returns NULL if
+ * the user haven't specified a specific outbound address in either
+ * OutboundBindAddress or OutboundBindAddressPT. */
+STATIC const tor_addr_t *
+managed_proxy_outbound_address(const or_options_t *options, sa_family_t family)
+{
+  tor_assert(options);
+
+  const tor_addr_t *address = NULL;
+  int family_index;
+
+  switch (family) {
+  case AF_INET:
+    family_index = 0;
+    break;
+  case AF_INET6:
+    family_index = 1;
+    break;
+  default:
+    /* LCOV_EXCL_START */
+    tor_assert_unreached();
+    return NULL;
+    /* LCOV_EXCL_STOP */
+  }
+
+  /* We start by checking if the user specified an address in
+   * OutboundBindAddressPT. */
+  address = &options->OutboundBindAddresses[OUTBOUND_ADDR_PT][family_index];
+
+  if (! tor_addr_is_null(address))
+    return address;
+
+  /* We fallback to check if the user specified an address in
+   * OutboundBindAddress. */
+  address = &options->OutboundBindAddresses[OUTBOUND_ADDR_ANY][family_index];
+
+  if (! tor_addr_is_null(address))
+    return address;
+
+  /* The user have not specified a preference for outgoing connections. */
+  return NULL;
+}
+
+STATIC const char *
+managed_proxy_state_to_string(enum pt_proto_state state)
+{
+  switch (state) {
+  case PT_PROTO_INFANT:
+    return "Infant";
+  case PT_PROTO_LAUNCHED:
+    return "Launched";
+  case PT_PROTO_ACCEPTING_METHODS:
+    return "Accepting methods";
+  case PT_PROTO_CONFIGURED:
+    return "Configured";
+  case PT_PROTO_COMPLETED:
+    return "Completed";
+  case PT_PROTO_BROKEN:
+    return "Broken";
+  case PT_PROTO_FAILED_LAUNCH:
+    return "Failed to launch";
+  }
+
+  /* LCOV_EXCL_START */
+  tor_assert_unreached();
+  return NULL;
+  /* LCOV_EXCL_STOP */
+}
+
+/** Set the internal state of the given <b>mp</b> to the given <b>new_state</b>
+ * value. */
+STATIC void
+managed_proxy_set_state(managed_proxy_t *mp, enum pt_proto_state new_state)
+{
+  if (mp->conf_state == new_state)
+    return;
+
+  tor_log(LOG_INFO, LD_PT, "Managed proxy \"%s\" changed state: %s -> %s",
+          mp->argv[0],
+          managed_proxy_state_to_string(mp->conf_state),
+          managed_proxy_state_to_string(new_state));
+
+  mp->conf_state = new_state;
 }

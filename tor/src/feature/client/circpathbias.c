@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2019, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -176,6 +176,7 @@ pathbias_get_scale_threshold(const or_options_t *options)
 static double
 pathbias_get_scale_ratio(const or_options_t *options)
 {
+  (void) options;
   /*
    * The scale factor is the denominator for our scaling
    * of circuit counts for our path bias window.
@@ -185,7 +186,8 @@ pathbias_get_scale_ratio(const or_options_t *options)
    */
   int denominator = networkstatus_get_param(NULL, "pb_scalefactor",
                               2, 2, INT32_MAX);
-  (void) options;
+  tor_assert(denominator > 0);
+
   /**
    * The mult factor is the numerator for our scaling
    * of circuit counts for our path bias window. It
@@ -301,7 +303,7 @@ pathbias_is_new_circ_attempt(origin_circuit_t *circ)
   return circ->cpath &&
          circ->cpath->next != circ->cpath &&
          circ->cpath->next->state == CPATH_STATE_AWAITING_KEYS;
-#else /* !(defined(N2N_TAGGING_IS_POSSIBLE)) */
+#else /* !defined(N2N_TAGGING_IS_POSSIBLE) */
   /* If tagging attacks are no longer possible, we probably want to
    * count bias from the first hop. However, one could argue that
    * timing-based tagging is still more useful than per-hop failure.
@@ -332,12 +334,23 @@ pathbias_should_count(origin_circuit_t *circ)
    * endpoint could be chosen maliciously.
    * Similarly, we can't count client-side intro attempts,
    * because clients can be manipulated into connecting to
-   * malicious intro points. */
+   * malicious intro points.
+   *
+   * Finally, avoid counting conflux circuits for now, because
+   * a malicious exit could cause us to reconnect and blame
+   * our guard...
+   *
+   * TODO-329-PURPOSE: This is not quite right, we could
+   * instead avoid sending usable probes on conflux circs,
+   * and count only linked circs as failures, but it is
+   * not 100% clear that would result in accurate counts. */
   if (get_options()->UseEntryGuards == 0 ||
           circ->base_.purpose == CIRCUIT_PURPOSE_TESTING ||
           circ->base_.purpose == CIRCUIT_PURPOSE_CONTROLLER ||
           circ->base_.purpose == CIRCUIT_PURPOSE_S_CONNECT_REND ||
           circ->base_.purpose == CIRCUIT_PURPOSE_S_REND_JOINED ||
+          circ->base_.purpose == CIRCUIT_PURPOSE_CONFLUX_UNLINKED ||
+          circ->base_.purpose == CIRCUIT_PURPOSE_CONFLUX_LINKED ||
           (circ->base_.purpose >= CIRCUIT_PURPOSE_C_INTRODUCING &&
            circ->base_.purpose <= CIRCUIT_PURPOSE_C_INTRODUCE_ACKED)) {
 
@@ -361,6 +374,17 @@ pathbias_should_count(origin_circuit_t *circ)
     return 0;
   }
 
+  /* Ignore circuits where the controller helped choose the path.  When
+   * this happens, we can't be sure whether the path was chosen randomly
+   * or not. */
+  if (circ->any_hop_from_controller) {
+    /* (In this case, we _don't_ check to see if shouldcount is changing,
+     * since it's possible that an already-created circuit later gets extended
+     * by the controller. */
+    circ->pathbias_shouldcount = PATHBIAS_SHOULDCOUNT_IGNORED;
+    return 0;
+  }
+
   /* Completely ignore one hop circuits */
   if (circ->build_state->onehop_tunnel ||
       circ->build_state->desired_path_len == 1) {
@@ -369,8 +393,9 @@ pathbias_should_count(origin_circuit_t *circ)
         !circ->build_state->onehop_tunnel) {
       if ((rate_msg = rate_limit_log(&count_limit, approx_time()))) {
         log_info(LD_BUG,
-               "One-hop circuit has length %d. Path state is %s. "
+               "One-hop circuit %d has length %d. Path state is %s. "
                "Circuit is a %s currently %s.%s",
+               circ->global_identifier,
                circ->build_state->desired_path_len,
                pathbias_state_to_string(circ->path_state),
                circuit_purpose_to_string(circ->base_.purpose),
@@ -398,12 +423,13 @@ pathbias_should_count(origin_circuit_t *circ)
   /* Check to see if the shouldcount result has changed due to a
    * unexpected purpose change that would affect our results */
   if (circ->pathbias_shouldcount == PATHBIAS_SHOULDCOUNT_IGNORED) {
-      log_info(LD_BUG,
-              "Circuit %d is now being counted despite being ignored "
-              "in the past. Purpose is %s, path state is %s",
-              circ->global_identifier,
-              circuit_purpose_to_string(circ->base_.purpose),
-              pathbias_state_to_string(circ->path_state));
+    log_info(LD_CIRC,
+            "Circuit %d is not being counted by pathbias because it was "
+            "ignored in the past. Purpose is %s, path state is %s",
+            circ->global_identifier,
+            circuit_purpose_to_string(circ->base_.purpose),
+            pathbias_state_to_string(circ->path_state));
+    return 0;
   }
   circ->pathbias_shouldcount = PATHBIAS_SHOULDCOUNT_COUNTED;
 
@@ -434,8 +460,9 @@ pathbias_count_build_attempt(origin_circuit_t *circ)
       if ((rate_msg = rate_limit_log(&circ_attempt_notice_limit,
                                      approx_time()))) {
         log_info(LD_BUG,
-                "Opened circuit is in strange path state %s. "
+                "Opened circuit %d is in strange path state %s. "
                 "Circuit is a %s currently %s.%s",
+                circ->global_identifier,
                 pathbias_state_to_string(circ->path_state),
                 circuit_purpose_to_string(circ->base_.purpose),
                 circuit_state_to_string(circ->base_.state),
@@ -468,8 +495,9 @@ pathbias_count_build_attempt(origin_circuit_t *circ)
           if ((rate_msg = rate_limit_log(&circ_attempt_notice_limit,
                   approx_time()))) {
             log_info(LD_BUG,
-                   "Unopened circuit has strange path state %s. "
+                   "Unopened circuit %d has strange path state %s. "
                    "Circuit is a %s currently %s.%s",
+                   circ->global_identifier,
                    pathbias_state_to_string(circ->path_state),
                    circuit_purpose_to_string(circ->base_.purpose),
                    circuit_state_to_string(circ->base_.state),
@@ -538,8 +566,9 @@ pathbias_count_build_success(origin_circuit_t *circ)
         if ((rate_msg = rate_limit_log(&success_notice_limit,
                 approx_time()))) {
           log_info(LD_BUG,
-              "Succeeded circuit is in strange path state %s. "
+              "Succeeded circuit %d is in strange path state %s. "
               "Circuit is a %s currently %s.%s",
+              circ->global_identifier,
               pathbias_state_to_string(circ->path_state),
               circuit_purpose_to_string(circ->base_.purpose),
               circuit_state_to_string(circ->base_.state),
@@ -574,8 +603,9 @@ pathbias_count_build_success(origin_circuit_t *circ)
       if ((rate_msg = rate_limit_log(&success_notice_limit,
               approx_time()))) {
         log_info(LD_BUG,
-            "Opened circuit is in strange path state %s. "
+            "Opened circuit %d is in strange path state %s. "
             "Circuit is a %s currently %s.%s",
+            circ->global_identifier,
             pathbias_state_to_string(circ->path_state),
             circuit_purpose_to_string(circ->base_.purpose),
             circuit_state_to_string(circ->base_.state),
@@ -601,8 +631,9 @@ pathbias_count_use_attempt(origin_circuit_t *circ)
 
   if (circ->path_state < PATH_STATE_BUILD_SUCCEEDED) {
     log_notice(LD_BUG,
-        "Used circuit is in strange path state %s. "
+        "Used circuit %d is in strange path state %s. "
         "Circuit is a %s currently %s.",
+        circ->global_identifier,
         pathbias_state_to_string(circ->path_state),
         circuit_purpose_to_string(circ->base_.purpose),
         circuit_state_to_string(circ->base_.state));
@@ -674,7 +705,7 @@ pathbias_mark_use_success(origin_circuit_t *circ)
 }
 
 /**
- * If a stream ever detatches from a circuit in a retriable way,
+ * If a stream ever detaches from a circuit in a retriable way,
  * we need to mark this circuit as still needing either another
  * successful stream, or in need of a probe.
  *
@@ -816,6 +847,11 @@ pathbias_send_usable_probe(circuit_t *circ)
               sizeof(ocirc->pathbias_probe_nonce));
   ocirc->pathbias_probe_nonce &= 0x00ffffff;
   probe_nonce = tor_dup_ip(ocirc->pathbias_probe_nonce);
+
+  if (!probe_nonce) {
+    log_err(LD_BUG, "Failed to generate nonce");
+    return -1;
+  }
 
   tor_snprintf(payload,RELAY_PAYLOAD_SIZE, "%s:25", probe_nonce);
   payload_len = (int)strlen(payload)+1;
